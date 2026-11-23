@@ -1,28 +1,61 @@
-# Gera o ControleBrilho.exe no Windows e publica uma release
-# sempre que uma tag "v*" (ex.: v1.0.0) é enviada ao GitHub.
+# Gera o ControleBrilho.exe no Windows e publica uma release.
+#
+# Dispara quando:
+#  - há um push na main: usa a versão do arquivo VERSION (ex.: 1.0.0 -> v1.0.0)
+#    e só publica se ainda não existir release para essa versão;
+#  - uma tag "v*" é enviada: (re)publica a release dessa tag;
+#  - manualmente, em Actions -> Release -> Run workflow.
 name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Definir versão
+        id: versao
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+            $publicar = "true"
+          } else {
+            $tag = "v" + (Get-Content VERSION -Raw).Trim()
+            gh release view $tag *> $null
+            $publicar = if ($LASTEXITCODE -eq 0) { "false" } else { "true" }
+          }
+          Write-Output "Versão: $tag  |  publicar: $publicar"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "publicar=$publicar" >> $env:GITHUB_OUTPUT
+          exit 0
+
       - uses: actions/setup-python@v5
+        if: steps.versao.outputs.publicar == 'true'
         with:
           python-version: "3.12"
 
       - name: Instalar dependências
+        if: steps.versao.outputs.publicar == 'true'
         run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
 
       - name: Gerar o executável
+        if: steps.versao.outputs.publicar == 'true'
         run: >
           python -m PyInstaller --noconfirm --onefile --windowed
           --name ControleBrilho --icon icone.ico --add-data "icone.ico;."
@@ -32,6 +65,7 @@ jobs:
           brilho.py
 
       - name: Empacotar
+        if: steps.versao.outputs.publicar == 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force pacote/ControleBrilho | Out-Null
@@ -39,14 +73,14 @@ jobs:
           Compress-Archive -Path pacote/ControleBrilho -DestinationPath ControleBrilho.zip -Force
 
       - name: Publicar release
+        if: steps.versao.outputs.publicar == 'true'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = "${{ steps.versao.outputs.tag }}"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag ControleBrilho.zip --clobber
           } else {
-            gh release create $tag ControleBrilho.zip --title "Controle de Brilho $tag" --notes-file .github/release-notes.md
+            gh release create $tag ControleBrilho.zip --target $env:GITHUB_SHA `
+              --title "Controle de Brilho $tag" --notes-file .github/release-notes.md
           }

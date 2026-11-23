@@ -116,12 +116,7 @@ Para gerar o `.exe`, execute o **`build.bat`** no Windows. O arquivo é criado e
 
 ### Publicar uma nova versão
 
-Envie uma tag começando com `v`. O GitHub Actions compila o `.exe` no Windows e publica a release com o `ControleBrilho.zip`.
-
-```bash
-git tag v1.1.0
-git push origin v1.1.0
-```
+Altere o número no arquivo [`VERSION`](VERSION), por exemplo para `1.1.0`, e envie para a `main`. O GitHub Actions compila o `.exe` no Windows e publica a release `v1.1.0` com o `ControleBrilho.zip`. Pushes que não mudam a versão não geram release nova.
 
 O código também funciona no **Linux** (X11). Nesse caso:
 - carregue o módulo `i2c-dev` (`sudo modprobe i2c-dev`) e dê ao seu usuário acesso a `/dev/i2c-*` (grupo `i2c`);
