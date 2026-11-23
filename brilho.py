@@ -88,6 +88,15 @@ def carregar_config():
     return cfg
 
 
+def salvar_config(cfg):
+    try:
+        ARQUIVO_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception as e:
+        avisar(f"Não foi possível salvar o config.json: {e}", erro=True)
+        return False
+
+
 def salvar_opcao(chave, valor):
     """Altera uma única opção no config.json, preservando o resto do arquivo."""
     try:
@@ -241,79 +250,183 @@ class Controlador:
 # Atalhos globais
 # --------------------------------------------------------------------------
 
-def iniciar_atalhos(cfg, ctrl):
+def _vk_de_caractere(c):
+    """Código virtual (Windows) da tecla que produz o caractere `c`."""
+    if c.isascii() and c.isalnum():
+        return ord(c.upper())
     try:
-        from pynput import keyboard
-    except Exception as e:
-        avisar(f"Atalhos globais indisponíveis: {e}", erro=True)
+        import ctypes
+        r = ctypes.windll.user32.VkKeyScanW(ord(c))
+        return r & 0xFF if r != -1 else None
+    except Exception:
         return None
 
-    mapa = {}
 
-    def adicionar(atalho, acao, descricao):
-        if not atalho:
-            return
+class GerenciadorAtalhos:
+    """Escuta o teclado globalmente e dispara presets e ajustes.
+
+    Pode ser recarregado (após editar as configurações) e pausado (enquanto
+    o usuário grava um novo atalho na tela de configurações).
+    """
+
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+        self.pausado = False
+        self._combinacoes = []
+        self._ouvinte = None
+        self._keyboard = None
         try:
-            keyboard.HotKey.parse(atalho)
-        except ValueError:
-            avisar(f"Atalho inválido ignorado: {atalho!r} ({descricao})", erro=True)
-            return
-        if atalho in mapa:
-            avisar(f"Atalho repetido ignorado: {atalho!r} ({descricao})", erro=True)
-            return
-        mapa[atalho] = acao
+            from pynput import keyboard
+            self._keyboard = keyboard
+        except Exception as e:
+            avisar(f"Atalhos globais indisponíveis: {e}", erro=True)
 
-    atalhos = cfg.get("atalhos", {})
-    adicionar(atalhos.get("aumentar"), lambda: ctrl.ajustar(+1), "aumentar")
-    adicionar(atalhos.get("diminuir"), lambda: ctrl.ajustar(-1), "diminuir")
-    for p in cfg.get("presets", []):
-        adicionar(p.get("atalho"), lambda b=p["brilho"]: ctrl.aplicar(b), p.get("nome"))
+    @property
+    def ativo(self):
+        return self._ouvinte is not None and bool(self._combinacoes)
 
-    if not mapa:
-        return None
-
-    # No Windows, com Ctrl/Alt pressionados a tecla "1" chega só como código
-    # virtual (vk=49), sem o caractere — e o GlobalHotKeys do pynput não a
-    # reconhece. Por isso comparamos letras e números pelo código virtual.
-    def normalizar(tecla):
-        if not isinstance(tecla, keyboard.KeyCode) or sys.platform != "win32":
+    def _normalizar(self, tecla):
+        # No Windows, com Ctrl/Alt pressionados a tecla "1" chega só como código
+        # virtual (vk=49), sem o caractere. Por isso comparamos tudo pelo vk.
+        kb = self._keyboard
+        if not isinstance(tecla, kb.KeyCode) or sys.platform != "win32":
             return tecla
         if tecla.vk is not None:
-            return keyboard.KeyCode.from_vk(tecla.vk)
-        if tecla.char and len(tecla.char) == 1 and tecla.char.isascii() and tecla.char.isalnum():
-            return keyboard.KeyCode.from_vk(ord(tecla.char.upper()))
+            return kb.KeyCode.from_vk(tecla.vk)
+        if tecla.char and len(tecla.char) == 1:
+            vk = _vk_de_caractere(tecla.char)
+            if vk:
+                return kb.KeyCode.from_vk(vk)
         return tecla
 
-    combinacoes = [
-        keyboard.HotKey([normalizar(t) for t in keyboard.HotKey.parse(atalho)], acao)
-        for atalho, acao in mapa.items()
-    ]
+    def carregar(self, cfg, mostrar_erros=True):
+        """(Re)lê os atalhos do cfg. Retorna a lista de problemas encontrados."""
+        if not self._keyboard:
+            return []
+        kb = self._keyboard
+        mapa, problemas = {}, []
 
-    def ao_pressionar(tecla):
-        tecla = normalizar(ouvinte.canonical(tecla))
-        for c in combinacoes:
+        def adicionar(atalho, acao, descricao):
+            if not atalho:
+                return
+            try:
+                teclas = kb.HotKey.parse(atalho)
+            except ValueError:
+                problemas.append(f"Atalho inválido ignorado: {atalho!r} ({descricao})")
+                return
+            chave = frozenset(self._normalizar(t) for t in teclas)
+            if chave in mapa:
+                problemas.append(f"Atalho repetido ignorado: {descrever_atalho(atalho)} ({descricao})")
+                return
+            mapa[chave] = acao
+
+        ctrl = self.ctrl
+        atalhos = cfg.get("atalhos", {})
+        adicionar(atalhos.get("aumentar"), lambda: ctrl.ajustar(+1), "aumentar")
+        adicionar(atalhos.get("diminuir"), lambda: ctrl.ajustar(-1), "diminuir")
+        for p in cfg.get("presets", []):
+            adicionar(p.get("atalho"), lambda b=p.get("brilho"): ctrl.aplicar(b), p.get("nome"))
+
+        self._combinacoes = [kb.HotKey(list(teclas), acao) for teclas, acao in mapa.items()]
+        if self._combinacoes and self._ouvinte is None:
+            self._ouvinte = kb.Listener(on_press=self._ao_pressionar, on_release=self._ao_soltar)
+            self._ouvinte.daemon = True
+            self._ouvinte.start()
+        if mostrar_erros and problemas:
+            avisar("\n".join(problemas), erro=True)
+        return problemas
+
+    def _ao_pressionar(self, tecla):
+        if self.pausado:
+            return
+        tecla = self._normalizar(self._ouvinte.canonical(tecla))
+        for c in self._combinacoes:
             c.press(tecla)
 
-    def ao_soltar(tecla):
-        tecla = normalizar(ouvinte.canonical(tecla))
-        for c in combinacoes:
+    def _ao_soltar(self, tecla):
+        tecla = self._normalizar(self._ouvinte.canonical(tecla))
+        for c in self._combinacoes:
             c.release(tecla)
 
-    ouvinte = keyboard.Listener(on_press=ao_pressionar, on_release=ao_soltar)
-    ouvinte.daemon = True
-    ouvinte.start()
-    return ouvinte
+    def aguardar(self):
+        if self._ouvinte:
+            self._ouvinte.join()
+
+
+NOMES_TECLAS = {
+    "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "cmd": "Win",
+    "page_up": "PgUp", "page_down": "PgDn", "up": "Seta acima", "down": "Seta abaixo",
+    "left": "Seta esquerda", "right": "Seta direita", "home": "Home", "end": "End",
+    "insert": "Insert", "delete": "Delete", "space": "Espaço",
+    "pause": "Pause", "print_screen": "PrtSc", "scroll_lock": "ScrLk",
+}
+
+
+def _nome_vk(vk):
+    if 96 <= vk <= 105:
+        return f"Num{vk - 96}"
+    nomes = {106: "Num*", 107: "Num+", 109: "Num-", 110: "Num.", 111: "Num/"}
+    if vk in nomes:
+        return nomes[vk]
+    try:
+        import ctypes
+        c = ctypes.windll.user32.MapVirtualKeyW(vk, 2)  # MAPVK_VK_TO_CHAR
+        if c:
+            return chr(c & 0xFFFF).upper()
+    except Exception:
+        pass
+    return f"Tecla {vk}"
 
 
 def descrever_atalho(atalho):
+    """'<ctrl>+<alt>+<page_up>' -> 'Ctrl+Alt+PgUp'"""
     if not atalho:
         return ""
-    partes = atalho.replace("<", "").replace(">", "").split("+")
-    nomes = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "cmd": "Win",
-             "page_up": "PgUp", "page_down": "PgDn", "up": "↑", "down": "↓"}
-    return "+".join(nomes.get(p, p.upper()) for p in partes)
+    partes = []
+    for p in atalho.split("+"):
+        nome = p[1:-1] if len(p) > 2 and p[0] == "<" and p[-1] == ">" else p
+        if nome.isdigit() and len(p) > 1:
+            partes.append(_nome_vk(int(nome)))
+        else:
+            partes.append(NOMES_TECLAS.get(nome, nome.upper()))
+    return "+".join(partes)
 
 
+# Teclas aceitas na gravação de atalhos (Windows: código virtual -> nome pynput)
+_VK_NOMES = {0x21: "<page_up>", 0x22: "<page_down>", 0x23: "<end>", 0x24: "<home>",
+             0x25: "<left>", 0x26: "<up>", 0x27: "<right>", 0x28: "<down>",
+             0x2D: "<insert>", 0x2E: "<delete>", 0x20: "<space>", 0x13: "<pause>"}
+_KEYSYM_NOMES = {"prior": "<page_up>", "next": "<page_down>", "end": "<end>",
+                 "home": "<home>", "left": "<left>", "up": "<up>", "right": "<right>",
+                 "down": "<down>", "insert": "<insert>", "delete": "<delete>",
+                 "space": "<space>", "pause": "<pause>"}
+MODIFICADORES_TK = {
+    "control_l": "ctrl", "control_r": "ctrl", "alt_l": "alt", "alt_r": "alt",
+    "shift_l": "shift", "shift_r": "shift", "win_l": "cmd", "win_r": "cmd",
+    "super_l": "cmd", "super_r": "cmd", "meta_l": "alt", "meta_r": "alt",
+    "iso_level3_shift": "alt",
+}
+
+
+def tecla_de_evento_tk(evento):
+    """Converte um <KeyPress> do tkinter no nome usado pelo pynput (ou None)."""
+    if sys.platform == "win32":
+        vk = evento.keycode
+        if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+            return chr(vk).lower()
+        if 0x70 <= vk <= 0x87:
+            return f"<f{vk - 0x6F}>"
+        if vk in _VK_NOMES:
+            return _VK_NOMES[vk]
+        if 0x60 <= vk <= 0x6F or 0xBA <= vk <= 0xC0 or 0xDB <= vk <= 0xDF or vk == 0xE2:
+            return f"<{vk}>"  # teclado numérico e pontuação: pelo código virtual
+        return None
+    ks = evento.keysym.lower()
+    if len(ks) == 1 and ks.isalnum():
+        return ks
+    if ks.startswith("f") and ks[1:].isdigit():
+        return f"<{ks}>"
+    return _KEYSYM_NOMES.get(ks)
 
 
 # --------------------------------------------------------------------------
@@ -422,177 +535,623 @@ def imagem_icone():
     return img
 
 
-def criar_bandeja(cfg, ctrl, pedidos):
-    """Cria o ícone da bandeja. Ações de janela vão para a fila `pedidos`,
-    que a thread do tkinter processa (tkinter não é seguro entre threads)."""
-    try:
-        import pystray
-    except Exception as e:
-        avisar(f"Ícone na bandeja indisponível: {e}", erro=True)
-        return None
-
-    def item_preset(p):
-        texto = p["nome"]
-        if p.get("atalho"):
-            texto += f"\t{descrever_atalho(p['atalho'])}"
-        return pystray.MenuItem(texto, lambda: ctrl.aplicar(p["brilho"]))
-
-    def alternar_autostart():
-        novo = not autostart_ativo()
-        definir_autostart(novo)
-        salvar_opcao("iniciar_com_windows", novo)
-
-    itens = [
-        pystray.MenuItem("Abrir controles", lambda: pedidos.put("mostrar"), default=True),
-        pystray.Menu.SEPARATOR,
-        *[item_preset(p) for p in cfg.get("presets", [])],
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem(f"Aumentar {ctrl.passo}%", lambda: ctrl.ajustar(+1)),
-        pystray.MenuItem(f"Diminuir {ctrl.passo}%", lambda: ctrl.ajustar(-1)),
-        pystray.Menu.SEPARATOR,
-    ]
-    if sys.platform == "win32":
-        itens.append(pystray.MenuItem("Iniciar com o Windows", alternar_autostart,
-                                      checked=lambda item: autostart_ativo()))
-    itens.append(pystray.MenuItem("Sair", lambda: pedidos.put("sair")))
-
-    icone = pystray.Icon("ControleBrilho", imagem_icone(), "Controle de Brilho",
-                         pystray.Menu(*itens))
-    try:
-        icone.run_detached()
-    except Exception as e:
-        avisar(f"Ícone na bandeja indisponível: {e}", erro=True)
-        return None
-    return icone
-
-
 def texto_dica(ctrl):
     partes = [f"{m.nome}: {v}%" for m, v in zip(ctrl.monitores, ctrl.valores)]
     return ("Brilho — " + " · ".join(partes))[:127]  # limite do Windows
 
 
+def valores_do_preset(brilho, n):
+    """Converte o campo 'brilho' de um preset numa lista com n valores (None = não altera)."""
+    if isinstance(brilho, (int, float)):
+        return [int(brilho)] * n
+    lista = list(brilho or [])
+    return (lista + [None] * n)[:n]
+
+
+def centralizar(janela, referencia=None):
+    """Posiciona a janela no centro da tela (ou sobre a janela de referência)."""
+    janela.update_idletasks()
+    w, h = janela.winfo_reqwidth(), janela.winfo_reqheight()
+    if referencia is not None and referencia.winfo_viewable():
+        x = referencia.winfo_rootx() + (referencia.winfo_width() - w) // 2
+        y = referencia.winfo_rooty() + (referencia.winfo_height() - h) // 3
+    else:
+        x = (janela.winfo_screenwidth() - w) // 2
+        y = (janela.winfo_screenheight() - h) // 3
+    janela.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+
+def texto_valor(v):
+    return "—" if v is None else f"{v}%"
+
+
 # --------------------------------------------------------------------------
-# Janela (tkinter)
+# Campo que grava um atalho: clique e pressione a combinação de teclas
 # --------------------------------------------------------------------------
 
-def executar_interface(cfg, ctrl, pedidos, minimizado):
+def criar_campo_atalho(pai, atalhos, valor_inicial=""):
     import tkinter as tk
     from tkinter import ttk
 
-    raiz = tk.Tk()
-    raiz.title("Controle de Brilho")
-    raiz.resizable(False, False)
-    icone_ico = Path(getattr(sys, "_MEIPASS", PASTA)) / "icone.ico"
-    if icone_ico.exists() and sys.platform == "win32":
-        raiz.iconbitmap(str(icone_ico))
-
-    bandeja = criar_bandeja(cfg, ctrl, pedidos)
-    if minimizado and bandeja:
-        raiz.withdraw()
+    quadro = ttk.Frame(pai)
+    estado = {"valor": valor_inicial or "", "pressionadas": set(), "gravando": False}
+    texto = tk.StringVar(value=descrever_atalho(estado["valor"]) or "(nenhum)")
+    campo = ttk.Entry(quadro, textvariable=texto, width=22, state="readonly", cursor="hand2")
+    campo.pack(side="left")
 
     def mostrar():
-        raiz.deiconify()
-        raiz.lift()
-        raiz.attributes("-topmost", True)
-        raiz.after(200, lambda: raiz.attributes("-topmost", False))
-        raiz.focus_force()
+        texto.set(descrever_atalho(estado["valor"]) or "(nenhum)")
 
-    def sair():
-        if bandeja:
-            bandeja.stop()
-        raiz.destroy()
+    def iniciar(_=None):
+        estado["gravando"] = True
+        estado["pressionadas"].clear()
+        atalhos.pausado = True  # não dispara presets enquanto grava
+        texto.set("Pressione a combinação…")
 
-    # Fechar a janela só a esconde; o programa continua na bandeja.
-    raiz.protocol("WM_DELETE_WINDOW", raiz.withdraw if bandeja else sair)
+    def parar(_=None):
+        estado["gravando"] = False
+        atalhos.pausado = False
+        mostrar()
 
-    quadro = ttk.Frame(raiz, padding=14)
-    quadro.grid()
-    barras = []
+    def modificadores(evento):
+        mods = set(estado["pressionadas"])
+        if evento.state & 0x4:
+            mods.add("ctrl")
+        if evento.state & 0x1:
+            mods.add("shift")
+        if evento.state & (0x20000 if sys.platform == "win32" else 0x8):
+            mods.add("alt")
+        return mods
 
-    def ao_mover(indice):
-        def callback(valor):
-            valor = int(float(valor))
-            if valor != ctrl.valores[indice]:  # ignora quando foi a sincronização
-                ctrl.definir(indice, valor)
-        return callback
+    def ao_pressionar(evento):
+        if not estado["gravando"]:
+            iniciar()
+        ks = evento.keysym.lower()
+        if ks in MODIFICADORES_TK:
+            estado["pressionadas"].add(MODIFICADORES_TK[ks])
+            ordem = [m for m in ("ctrl", "alt", "shift", "cmd") if m in modificadores(evento)]
+            texto.set("+".join(NOMES_TECLAS[m] for m in ordem) + "+…")
+            return "break"
+        if ks == "escape":
+            quadro.winfo_toplevel().focus_set()
+            return "break"
+        tecla = tecla_de_evento_tk(evento)
+        if tecla is None:
+            texto.set("Tecla não suportada")
+            return "break"
+        mods = modificadores(evento)
+        if not (mods & {"ctrl", "alt", "cmd"}) and not tecla.startswith("<f"):
+            texto.set("Use Ctrl, Alt ou Win + tecla")
+            return "break"
+        ordem = [m for m in ("ctrl", "alt", "shift", "cmd") if m in mods]
+        estado["valor"] = "+".join([f"<{m}>" for m in ordem] + [tecla])
+        quadro.winfo_toplevel().focus_set()  # encerra a gravação
+        return "break"
 
-    linha = 0
-    for i, mon in enumerate(ctrl.monitores):
-        ttk.Label(quadro, text=mon.nome, width=12).grid(row=linha, column=0, sticky="w")
-        barra = tk.Scale(quadro, from_=0, to=100, orient="horizontal", length=280,
-                         resolution=1, command=ao_mover(i))
-        barra.set(ctrl.valores[i])
-        barra.grid(row=linha, column=1, pady=2)
-        barras.append(barra)
+    def ao_soltar(evento):
+        ks = evento.keysym.lower()
+        if ks in MODIFICADORES_TK:
+            estado["pressionadas"].discard(MODIFICADORES_TK[ks])
+        return "break"
+
+    def limpar():
+        estado["valor"] = ""
+        quadro.winfo_toplevel().focus_set()
+        mostrar()
+
+    campo.bind("<FocusIn>", iniciar)
+    campo.bind("<FocusOut>", parar)
+    campo.bind("<KeyPress>", ao_pressionar)
+    campo.bind("<KeyRelease>", ao_soltar)
+    ttk.Button(quadro, text="Limpar", width=7, command=limpar).pack(side="left", padx=(4, 0))
+    quadro.obter = lambda: estado["valor"]
+    return quadro
+
+
+# --------------------------------------------------------------------------
+# Aplicativo: janela principal, bandeja e configurações
+# --------------------------------------------------------------------------
+
+class App:
+    def __init__(self, cfg, ctrl, atalhos, pedidos, minimizado):
+        import tkinter as tk
+        self.cfg, self.ctrl, self.atalhos, self.pedidos = cfg, ctrl, atalhos, pedidos
+        self.raiz = tk.Tk()
+        self.raiz.title("Controle de Brilho")
+        self.raiz.resizable(False, False)
+        self.icone_ico = Path(getattr(sys, "_MEIPASS", PASTA)) / "icone.ico"
+        self._aplicar_icone(self.raiz)
+        # Ctrl+A seleciona todo o texto dos campos (padrão do Windows)
+        for classe in ("TEntry", "TSpinbox"):
+            self.raiz.bind_class(classe, "<Control-a>", lambda e: (
+                e.widget.select_range(0, "end"), e.widget.icursor("end"), "break")[-1])
+
+        self.bandeja = self._criar_bandeja()
+        if minimizado and self.bandeja:
+            self.raiz.withdraw()
+        # Fechar a janela só a esconde; o programa continua na bandeja.
+        self.raiz.protocol("WM_DELETE_WINDOW", self.raiz.withdraw if self.bandeja else self.sair)
+
+        self.janela_config = None
+        self.quadro = None
+        self.construir()
+        self.sincronizar()
+
+    def _aplicar_icone(self, janela):
+        if self.icone_ico.exists() and sys.platform == "win32":
+            try:
+                janela.iconbitmap(str(self.icone_ico))
+            except Exception:
+                pass
+
+    # ---------------- bandeja ----------------
+
+    def _menu_bandeja(self):
+        import pystray
+        ctrl, pedidos = self.ctrl, self.pedidos
+
+        def item_preset(p):
+            texto = p.get("nome", "?")
+            if p.get("atalho"):
+                texto += f"\t{descrever_atalho(p['atalho'])}"
+            return pystray.MenuItem(texto, lambda: ctrl.aplicar(p.get("brilho")))
+
+        def alternar_autostart():
+            novo = not autostart_ativo()
+            definir_autostart(novo)
+            self.cfg["iniciar_com_windows"] = novo
+            salvar_opcao("iniciar_com_windows", novo)
+
+        itens = [
+            pystray.MenuItem("Abrir controles", lambda: pedidos.put("mostrar"), default=True),
+            pystray.Menu.SEPARATOR,
+            *[item_preset(p) for p in self.cfg.get("presets", [])],
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"Aumentar {ctrl.passo}%", lambda: ctrl.ajustar(+1)),
+            pystray.MenuItem(f"Diminuir {ctrl.passo}%", lambda: ctrl.ajustar(-1)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Configurações…", lambda: pedidos.put("config")),
+        ]
+        if sys.platform == "win32":
+            itens.append(pystray.MenuItem("Iniciar com o Windows", alternar_autostart,
+                                          checked=lambda item: autostart_ativo()))
+        itens.append(pystray.MenuItem("Sair", lambda: pedidos.put("sair")))
+        return pystray.Menu(*itens)
+
+    def _criar_bandeja(self):
+        try:
+            import pystray
+            icone = pystray.Icon("ControleBrilho", imagem_icone(), "Controle de Brilho",
+                                 self._menu_bandeja())
+            icone.run_detached()
+            return icone
+        except Exception as e:
+            avisar(f"Ícone na bandeja indisponível: {e}", erro=True)
+            return None
+
+    # ---------------- janela principal ----------------
+
+    def construir(self):
+        import tkinter as tk
+        from tkinter import ttk
+        ctrl = self.ctrl
+        if self.quadro is not None:
+            self.quadro.destroy()
+        self.quadro = quadro = ttk.Frame(self.raiz, padding=14)
+        quadro.grid()
+        self.barras = []
+        self.barra_todos = None
+        self.estado_todos = {"ultimo": None}
+        self._ultimo = None
+
+        def ao_mover(indice):
+            def callback(valor):
+                valor = int(float(valor))
+                if valor != ctrl.valores[indice]:  # ignora quando foi a sincronização
+                    ctrl.definir(indice, valor)
+            return callback
+
+        largura = max([12] + [len(m.nome) + 2 for m in ctrl.monitores])
+        linha = 0
+        for i, mon in enumerate(ctrl.monitores):
+            ttk.Label(quadro, text=mon.nome, width=largura).grid(row=linha, column=0, sticky="w")
+            barra = tk.Scale(quadro, from_=0, to=100, orient="horizontal", length=280,
+                             resolution=1, command=ao_mover(i))
+            barra.set(ctrl.valores[i])
+            barra.grid(row=linha, column=1, pady=2)
+            self.barras.append(barra)
+            linha += 1
+
+        if len(ctrl.monitores) > 1:
+            ttk.Separator(quadro).grid(row=linha, column=0, columnspan=2, sticky="ew", pady=6)
+            linha += 1
+            ttk.Label(quadro, text="Todos", width=largura).grid(row=linha, column=0, sticky="w")
+
+            def mover_todos(valor):
+                valor = int(float(valor))
+                if valor != self.estado_todos["ultimo"]:
+                    self.estado_todos["ultimo"] = valor
+                    ctrl.aplicar(valor)
+
+            self.barra_todos = tk.Scale(quadro, from_=0, to=100, orient="horizontal",
+                                        length=280, resolution=1, command=mover_todos)
+            self.barra_todos.grid(row=linha, column=1, pady=2)
+            linha += 1
+
+        botoes = ttk.Frame(quadro)
+        botoes.grid(row=linha, column=0, columnspan=2, pady=(10, 0))
+        for n, p in enumerate(self.cfg.get("presets", [])):
+            texto = p.get("nome", "?")
+            if p.get("atalho"):
+                texto += f"\n{descrever_atalho(p['atalho'])}"
+            ttk.Button(botoes, text=texto, width=12,
+                       command=lambda b=p.get("brilho"): ctrl.aplicar(b)
+                       ).grid(row=n // 4, column=n % 4, padx=3, pady=3)
         linha += 1
 
-    barra_todos = None
-    estado_todos = {"ultimo": None}
-    if len(ctrl.monitores) > 1:
-        ttk.Separator(quadro).grid(row=linha, column=0, columnspan=2, sticky="ew", pady=6)
-        linha += 1
-        ttk.Label(quadro, text="Todos", width=12).grid(row=linha, column=0, sticky="w")
+        rodape = ttk.Frame(quadro)
+        rodape.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        atalhos = self.cfg.get("atalhos", {})
+        dicas = []
+        if atalhos.get("aumentar"):
+            dicas.append(f"{descrever_atalho(atalhos['aumentar'])}: +{ctrl.passo}%")
+        if atalhos.get("diminuir"):
+            dicas.append(f"{descrever_atalho(atalhos['diminuir'])}: −{ctrl.passo}%")
+        ttk.Label(rodape, text="   ".join(dicas), foreground="gray").pack(side="left")
+        ttk.Button(rodape, text="⚙ Configurações…", command=self.abrir_config).pack(side="right")
 
-        def mover_todos(valor):
-            valor = int(float(valor))
-            if valor != estado_todos["ultimo"]:
-                estado_todos["ultimo"] = valor
-                ctrl.aplicar(valor)
+    def mostrar(self):
+        r = self.raiz
+        r.deiconify()
+        r.lift()
+        r.attributes("-topmost", True)
+        r.after(200, lambda: r.attributes("-topmost", False))
+        r.focus_force()
 
-        barra_todos = tk.Scale(quadro, from_=0, to=100, orient="horizontal",
-                               length=280, resolution=1, command=mover_todos)
-        barra_todos.grid(row=linha, column=1, pady=2)
-        linha += 1
+    def sair(self):
+        if self.bandeja:
+            self.bandeja.stop()
+        self.raiz.destroy()
 
-    botoes = ttk.Frame(quadro)
-    botoes.grid(row=linha, column=0, columnspan=2, pady=(10, 0))
-    for p in cfg.get("presets", []):
-        texto = p["nome"]
-        if p.get("atalho"):
-            texto += f"\n{descrever_atalho(p['atalho'])}"
-        ttk.Button(botoes, text=texto,
-                   command=lambda b=p["brilho"]: ctrl.aplicar(b)).pack(side="left", padx=3)
-    linha += 1
-
-    atalhos = cfg.get("atalhos", {})
-    dica = (f"{descrever_atalho(atalhos.get('aumentar'))}: +{ctrl.passo}%   "
-            f"{descrever_atalho(atalhos.get('diminuir'))}: −{ctrl.passo}%")
-    ttk.Label(quadro, text=dica, foreground="gray").grid(
-        row=linha, column=0, columnspan=2, pady=(10, 0))
-
-    # Atalhos e bandeja rodam em outras threads; aqui a janela acompanha as
-    # mudanças e executa os pedidos de mostrar/sair.
-    ultimo = {"valores": None}
-
-    def sincronizar():
+    def sincronizar(self):
+        """Executa pedidos de outras threads e acompanha mudanças de brilho."""
         while True:
             try:
-                pedido = pedidos.get_nowait()
+                pedido = self.pedidos.get_nowait()
             except queue.Empty:
                 break
             if pedido == "mostrar":
-                mostrar()
+                self.mostrar()
+            elif pedido == "config":
+                self.abrir_config()
             elif pedido == "sair":
-                sair()
+                self.sair()
                 return
 
-        valores = list(ctrl.valores)
-        if valores != ultimo["valores"]:
-            ultimo["valores"] = valores
-            for barra, v in zip(barras, valores):
+        valores = list(self.ctrl.valores)
+        if valores != self._ultimo:
+            self._ultimo = valores
+            for barra, v in zip(self.barras, valores):
                 if int(barra.get()) != v:
                     barra.set(v)
-            if barra_todos is not None:
+            if self.barra_todos is not None:
                 media = round(sum(valores) / len(valores))
-                if media != estado_todos["ultimo"]:
-                    estado_todos["ultimo"] = media
-                    barra_todos.set(media)
-            if bandeja:
-                bandeja.title = texto_dica(ctrl)
-        raiz.after(150, sincronizar)
+                if media != self.estado_todos["ultimo"]:
+                    self.estado_todos["ultimo"] = media
+                    self.barra_todos.set(media)
+            if self.bandeja:
+                self.bandeja.title = texto_dica(self.ctrl)
+        self.raiz.after(150, self.sincronizar)
 
-    sincronizar()
-    raiz.mainloop()
+    def run(self):
+        self.raiz.mainloop()
+
+    # ---------------- configurações ----------------
+
+    def abrir_config(self):
+        if self.janela_config is not None and self.janela_config.winfo_exists():
+            self.janela_config.deiconify()
+            self.janela_config.lift()
+            self.janela_config.focus_force()
+            return
+        self.janela_config = JanelaConfig(self)
+
+    def aplicar_config(self, novo):
+        """Salva e aplica as novas configurações sem reiniciar o programa."""
+        self.cfg.clear()
+        self.cfg.update(novo)
+        salvar_config(self.cfg)
+        nomes = self.cfg.get("nomes_monitores") or []
+        for i, mon in enumerate(self.ctrl.monitores):
+            if i < len(nomes) and nomes[i]:
+                mon.nome = nomes[i]
+        self.ctrl.passo = int(self.cfg.get("passo", 10))
+        self.atalhos.carregar(self.cfg)
+        if sys.platform == "win32":
+            definir_autostart(bool(self.cfg.get("iniciar_com_windows", True)))
+        self.construir()
+        if self.bandeja:
+            self.bandeja.menu = self._menu_bandeja()
+            self.bandeja.title = texto_dica(self.ctrl)
+
+
+class JanelaConfig:
+    def __init__(self, app):
+        import copy
+        import tkinter as tk
+        from tkinter import ttk
+        self.app = app
+        self.n = len(app.ctrl.monitores)
+        self.presets = copy.deepcopy(app.cfg.get("presets", []))
+
+        self.janela = j = tk.Toplevel(app.raiz)
+        j.withdraw()  # monta escondida, centraliza e só então mostra
+        j.title("Configurações — Controle de Brilho")
+        j.resizable(False, False)
+        app._aplicar_icone(j)
+        j.protocol("WM_DELETE_WINDOW", self.fechar)
+        self.winfo_exists = j.winfo_exists
+        self.deiconify, self.lift, self.focus_force = j.deiconify, j.lift, j.focus_force
+        corpo = ttk.Frame(j, padding=12)
+        corpo.grid(sticky="nsew")
+
+        # Monitores
+        f_mon = ttk.LabelFrame(corpo, text="Monitores", padding=8)
+        f_mon.grid(row=0, column=0, sticky="ew")
+        self.nomes = []
+        for i, mon in enumerate(app.ctrl.monitores):
+            ttk.Label(f_mon, text=f"Monitor {i + 1}:").grid(row=i, column=0, sticky="w", padx=(0, 6))
+            var = tk.StringVar(value=mon.nome)
+            ttk.Entry(f_mon, textvariable=var, width=24).grid(row=i, column=1, sticky="w", pady=2)
+            self.nomes.append(var)
+
+        # Presets
+        f_pre = ttk.LabelFrame(corpo, text="Presets", padding=8)
+        f_pre.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        colunas = ["nome"] + [f"m{i}" for i in range(self.n)] + ["atalho"]
+        self.tabela = ttk.Treeview(f_pre, columns=colunas, show="headings", height=7,
+                                   selectmode="browse")
+        self.tabela.heading("nome", text="Nome")
+        self.tabela.column("nome", width=130)
+        for i, mon in enumerate(app.ctrl.monitores):
+            self.tabela.heading(f"m{i}", text=mon.nome)
+            self.tabela.column(f"m{i}", width=80, anchor="center")
+        self.tabela.heading("atalho", text="Atalho")
+        self.tabela.column("atalho", width=120, anchor="center")
+        self.tabela.grid(row=0, column=0, columnspan=6, sticky="ew")
+        self.tabela.bind("<Double-1>", lambda e: self.editar())
+        for c, (txt, cmd) in enumerate([("Adicionar", self.adicionar), ("Editar", self.editar),
+                                        ("Remover", self.remover), ("▲", lambda: self.mover(-1)),
+                                        ("▼", lambda: self.mover(+1))]):
+            ttk.Button(f_pre, text=txt, command=cmd, width=10 if len(txt) > 1 else 3).grid(
+                row=1, column=c, pady=(6, 0), padx=(0, 4), sticky="w")
+        self.atualizar_tabela()
+
+        # Atalhos de ajuste
+        f_at = ttk.LabelFrame(corpo, text="Atalhos de ajuste", padding=8)
+        f_at.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        atalhos = app.cfg.get("atalhos", {})
+        ttk.Label(f_at, text="Aumentar brilho:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.campo_aumentar = criar_campo_atalho(f_at, app.atalhos, atalhos.get("aumentar"))
+        self.campo_aumentar.grid(row=0, column=1, sticky="w", pady=2)
+        ttk.Label(f_at, text="Diminuir brilho:").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        self.campo_diminuir = criar_campo_atalho(f_at, app.atalhos, atalhos.get("diminuir"))
+        self.campo_diminuir.grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(f_at, text="Passo (%):").grid(row=2, column=0, sticky="w", padx=(0, 6))
+        self.passo = tk.IntVar(value=int(app.cfg.get("passo", 10)))
+        ttk.Spinbox(f_at, from_=1, to=50, textvariable=self.passo, width=6).grid(
+            row=2, column=1, sticky="w", pady=2)
+        ttk.Label(f_at, text="Clique num campo e pressione a combinação (Esc cancela).",
+                  foreground="gray").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # Geral
+        self.autostart = tk.BooleanVar(value=bool(app.cfg.get("iniciar_com_windows", True)))
+        if sys.platform == "win32":
+            ttk.Checkbutton(corpo, text="Iniciar com o Windows (minimizado na bandeja)",
+                            variable=self.autostart).grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+        botoes = ttk.Frame(corpo)
+        botoes.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(botoes, text="Cancelar", command=self.fechar).pack(side="right")
+        ttk.Button(botoes, text="Salvar", command=self.salvar).pack(side="right", padx=(0, 6))
+
+        centralizar(j)
+        j.deiconify()
+        j.lift()
+        j.focus_force()
+
+    # ---- presets ----
+
+    def atualizar_tabela(self, selecionar=None):
+        self.tabela.delete(*self.tabela.get_children())
+        for i, p in enumerate(self.presets):
+            valores = [texto_valor(v) for v in valores_do_preset(p.get("brilho"), self.n)]
+            self.tabela.insert("", "end", iid=str(i), values=[p.get("nome", "")] + valores
+                               + [descrever_atalho(p.get("atalho")) or "—"])
+        if selecionar is not None and 0 <= selecionar < len(self.presets):
+            self.tabela.selection_set(str(selecionar))
+            self.tabela.see(str(selecionar))
+
+    def _selecionado(self):
+        sel = self.tabela.selection()
+        return int(sel[0]) if sel else None
+
+    def adicionar(self):
+        novo = {"nome": "", "atalho": "", "brilho": 50}
+
+        def ok(p):
+            self.presets.append(p)
+            self.atualizar_tabela(len(self.presets) - 1)
+        DialogoPreset(self, novo, ok, titulo="Novo preset")
+
+    def editar(self):
+        i = self._selecionado()
+        if i is None:
+            return
+
+        def ok(p):
+            self.presets[i] = p
+            self.atualizar_tabela(i)
+        DialogoPreset(self, self.presets[i], ok, titulo="Editar preset")
+
+    def remover(self):
+        i = self._selecionado()
+        if i is None:
+            return
+        del self.presets[i]
+        self.atualizar_tabela(min(i, len(self.presets) - 1))
+
+    def mover(self, delta):
+        i = self._selecionado()
+        if i is None or not 0 <= i + delta < len(self.presets):
+            return
+        self.presets[i], self.presets[i + delta] = self.presets[i + delta], self.presets[i]
+        self.atualizar_tabela(i + delta)
+
+    # ---- salvar ----
+
+    def salvar(self):
+        from tkinter import messagebox
+        app = self.app
+        nomes_presets = [p.get("nome", "").strip() for p in self.presets]
+        if any(not n for n in nomes_presets):
+            messagebox.showerror("Configurações", "Todo preset precisa de um nome.", parent=self.janela)
+            return
+        repetidos = {n for n in nomes_presets if nomes_presets.count(n) > 1}
+        if repetidos:
+            messagebox.showerror("Configurações", f"Nome de preset repetido: {', '.join(repetidos)}",
+                                 parent=self.janela)
+            return
+
+        usados = {}
+        for descricao, atalho in ([("Aumentar brilho", self.campo_aumentar.obter()),
+                                   ("Diminuir brilho", self.campo_diminuir.obter())]
+                                  + [(f"Preset {p['nome']}", p.get("atalho")) for p in self.presets]):
+            if not atalho:
+                continue
+            if atalho in usados:
+                messagebox.showerror(
+                    "Configurações",
+                    f"O atalho {descrever_atalho(atalho)} está em \"{usados[atalho]}\" e em "
+                    f"\"{descricao}\". Escolha atalhos diferentes.", parent=self.janela)
+                return
+            usados[atalho] = descricao
+
+        try:
+            passo = max(1, min(50, int(self.passo.get())))
+        except Exception:
+            passo = 10
+
+        nomes_antigos = list(app.cfg.get("nomes_monitores") or [])
+        nomes = [v.get().strip() or f"Monitor {i + 1}" for i, v in enumerate(self.nomes)]
+        nomes += nomes_antigos[len(nomes):]  # preserva nomes de monitores não conectados
+
+        novo = dict(app.cfg)
+        novo.update({
+            "iniciar_com_windows": bool(self.autostart.get()),
+            "passo": passo,
+            "nomes_monitores": nomes,
+            "atalhos": {"aumentar": self.campo_aumentar.obter(),
+                        "diminuir": self.campo_diminuir.obter()},
+            "presets": self.presets,
+        })
+        app.aplicar_config(novo)
+        self.fechar()
+
+    def fechar(self):
+        self.app.atalhos.pausado = False
+        self.janela.destroy()
+
+
+class DialogoPreset:
+    def __init__(self, cfg_janela, preset, ao_confirmar, titulo):
+        import tkinter as tk
+        from tkinter import ttk
+        app = cfg_janela.app
+        self.ao_confirmar = ao_confirmar
+        self.original = preset
+        self.n = cfg_janela.n
+
+        self.janela = j = tk.Toplevel(cfg_janela.janela)
+        j.withdraw()
+        j.title(titulo)
+        j.resizable(False, False)
+        j.transient(cfg_janela.janela)
+        app._aplicar_icone(j)
+        corpo = ttk.Frame(j, padding=12)
+        corpo.grid()
+
+        ttk.Label(corpo, text="Nome:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.nome = tk.StringVar(value=preset.get("nome", ""))
+        entrada = ttk.Entry(corpo, textvariable=self.nome, width=28)
+        entrada.grid(row=0, column=1, columnspan=3, sticky="w", pady=(0, 6))
+
+        valores = valores_do_preset(preset.get("brilho"), self.n)
+        self.escalas, self.manter = [], []
+        for i, mon in enumerate(app.ctrl.monitores):
+            ttk.Label(corpo, text=f"{mon.nome}:").grid(row=1 + i, column=0, sticky="w", padx=(0, 8))
+            escala = tk.Scale(corpo, from_=0, to=100, orient="horizontal", length=220, resolution=1)
+            escala.set(50 if valores[i] is None else valores[i])
+            escala.grid(row=1 + i, column=1, sticky="w")
+            manter = tk.BooleanVar(value=valores[i] is None)
+
+            def alternar(e=escala, m=manter):
+                e.configure(state="disabled" if m.get() else "normal",
+                            fg="gray" if m.get() else "black")
+            ttk.Checkbutton(corpo, text="não alterar", variable=manter, command=alternar).grid(
+                row=1 + i, column=2, sticky="w", padx=(8, 0))
+            alternar()
+            self.escalas.append(escala)
+            self.manter.append(manter)
+
+        linha = 1 + self.n
+        ttk.Label(corpo, text="Atalho:").grid(row=linha, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.campo = criar_campo_atalho(corpo, app.atalhos, preset.get("atalho"))
+        self.campo.grid(row=linha, column=1, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(corpo, text="Clique no campo e pressione a combinação (Esc cancela).",
+                  foreground="gray").grid(row=linha + 1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        self.erro = ttk.Label(corpo, text="", foreground="#c0392b")
+        self.erro.grid(row=linha + 2, column=0, columnspan=4, sticky="w")
+        botoes = ttk.Frame(corpo)
+        botoes.grid(row=linha + 3, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        ttk.Button(botoes, text="Cancelar", command=self.fechar).pack(side="right")
+        ttk.Button(botoes, text="OK", command=self.confirmar).pack(side="right", padx=(0, 6))
+        j.protocol("WM_DELETE_WINDOW", self.fechar)
+        j.bind("<Return>", lambda e: self.confirmar())
+
+        self.app = app
+        centralizar(j, cfg_janela.janela)
+        j.deiconify()
+        j.wait_visibility()
+        j.grab_set()
+        entrada.focus_set()
+
+    def confirmar(self):
+        nome = self.nome.get().strip()
+        if not nome:
+            self.erro.configure(text="Digite um nome para o preset.")
+            return
+        valores = [None if m.get() else int(e.get()) for e, m in zip(self.escalas, self.manter)]
+        if all(v is None for v in valores):
+            self.erro.configure(text="Defina o brilho de pelo menos um monitor.")
+            return
+        if None not in valores and len(set(valores)) == 1:
+            brilho = valores[0]  # mesmo valor para todos: salva um número só
+        else:
+            brilho = valores
+            antigo = self.original.get("brilho")
+            if isinstance(antigo, list) and len(antigo) > self.n:
+                brilho = valores + antigo[self.n:]  # preserva monitores não conectados
+        preset = dict(self.original)
+        preset.update({"nome": nome, "brilho": brilho, "atalho": self.campo.obter()})
+        self.fechar()
+        self.ao_confirmar(preset)
+
+    def fechar(self):
+        self.app.atalhos.pausado = False
+        self.janela.grab_release()
+        self.janela.destroy()
 
 
 # --------------------------------------------------------------------------
@@ -649,19 +1208,20 @@ def main():
         definir_autostart(bool(cfg.get("iniciar_com_windows", True)))
 
     ctrl = Controlador(monitores, cfg.get("passo", 10))
-    ouvinte = iniciar_atalhos(cfg, ctrl)
+    atalhos = GerenciadorAtalhos(ctrl)
+    atalhos.carregar(cfg)
 
     if args.sem_janela:
-        if not ouvinte:
+        if not atalhos.ativo:
             falhar("Nenhum atalho ativo; nada a fazer.")
         print("Atalhos ativos. Ctrl+C para sair.")
         try:
-            ouvinte.join()
+            atalhos.aguardar()
         except KeyboardInterrupt:
             pass
         return
 
-    executar_interface(cfg, ctrl, pedidos, args.minimizado)
+    App(cfg, ctrl, atalhos, pedidos, args.minimizado).run()
 
 
 if __name__ == "__main__":

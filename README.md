@@ -13,9 +13,10 @@ Controle o brilho de **monitores externos no Windows** via **DDC/CI**, o mesmo c
 - 🖥️ Um controle deslizante por monitor, mais um controle **Todos**.
 - ⌨️ Atalhos globais que funcionam em qualquer programa, mesmo com a janela fechada.
 - 🎚️ Presets com um valor para todos os monitores ou um valor diferente para cada um.
+- ⚙️ Tela de configurações: crie e edite presets (nome, brilho de cada monitor e atalho) e grave atalhos pressionando as teclas.
 - 🔔 Ícone na bandeja: o menu tem presets e opções, e a dica mostra o brilho atual de cada monitor.
 - 🚀 Inicia minimizado com o Windows; dá para ligar ou desligar isso no menu, e não precisa de administrador.
-- 📝 Configuração simples em `config.json`.
+- 📝 Tudo é salvo em `config.json`, que também pode ser editado à mão.
 - 💻 Linha de comando: `--preset Noite`, `--definir 30 80`, `--listar`.
 
 ## Download e instalação
@@ -33,6 +34,8 @@ Na primeira execução, o programa cria o `config.json` ao lado do `.exe` e pass
 
 ## Atalhos padrão
 
+Todos podem ser alterados em **⚙ Configurações…**.
+
 | Atalho          | Ação                          |
 |-----------------|-------------------------------|
 | `Ctrl+Alt+1`    | Noite: 10%                    |
@@ -45,13 +48,33 @@ Na primeira execução, o programa cria o `config.json` ao lado do `.exe` e pass
 ## Bandeja do sistema
 
 - **Clique esquerdo** no ☀️ abre os controles deslizantes.
-- **Clique direito** abre o menu: presets, aumentar ou diminuir, **Iniciar com o Windows** e **Sair**.
+- **Clique direito** abre o menu: presets, aumentar ou diminuir, **Configurações…**, **Iniciar com o Windows** e **Sair**.
 - Fechar a janela no **X** só a esconde; os atalhos continuam ativos. Para encerrar de verdade, use **Sair**.
 - Abrir o `.exe` de novo com o programa já rodando apenas mostra a janela, sem criar uma segunda cópia.
 
-## Configuração
+## Configurações
 
-Edite o `config.json`, que fica na mesma pasta do `.exe`. Depois use **Sair** no menu da bandeja e abra o programa de novo.
+Clique em **⚙ Configurações…** na janela ou no menu da bandeja. As mudanças valem assim que você clica em **Salvar**, sem reiniciar o programa.
+
+<p>
+  <img src="docs/configuracoes.png" alt="Tela de configurações com monitores, lista de presets e atalhos de ajuste" height="420">
+  &nbsp;&nbsp;
+  <img src="docs/preset.png" alt="Edição de um preset: nome, brilho de cada monitor e atalho" height="190">
+</p>
+
+- **Monitores**: dê um nome a cada monitor; ele aparece na janela e nos presets.
+- **Presets**: use **Adicionar**, **Editar** (ou dê duplo clique), **Remover** e as setas ▲ ▼ para mudar a ordem. Em cada preset você define:
+  - o **nome**;
+  - o **brilho de cada monitor**; marque **não alterar** para manter o brilho atual daquele monitor;
+  - o **atalho**: clique no campo e pressione a combinação, por exemplo `Ctrl+Alt+5`. **Esc** cancela e **Limpar** remove o atalho.
+- **Atalhos de ajuste**: as combinações para aumentar e diminuir o brilho e o **passo** em %.
+- **Iniciar com o Windows**: liga ou desliga o início automático.
+
+Os atalhos precisam usar **Ctrl**, **Alt** ou **Win** junto com outra tecla; as teclas F1–F24 também podem ser usadas sozinhas. Se o mesmo atalho estiver em dois lugares, o programa avisa antes de salvar.
+
+### Editando o `config.json` à mão (opcional)
+
+As configurações ficam no `config.json`, na mesma pasta do `.exe`. Se editar o arquivo diretamente, use **Sair** no menu da bandeja e abra o programa de novo.
 
 ```json
 {
@@ -64,19 +87,18 @@ Edite o `config.json`, que fica na mesma pasta do `.exe`. Depois use **Sair** no
   },
   "presets": [
     {"nome": "Noite",   "atalho": "<ctrl>+<alt>+1", "brilho": 10},
-    {"nome": "Médio",   "atalho": "<ctrl>+<alt>+2", "brilho": 50},
-    {"nome": "Dia",     "atalho": "<ctrl>+<alt>+3", "brilho": 100},
-    {"nome": "Leitura", "atalho": "<ctrl>+<alt>+4", "brilho": [40, 60]}
+    {"nome": "Leitura", "atalho": "<ctrl>+<alt>+4", "brilho": [40, 60]},
+    {"nome": "Cinema",  "atalho": "<ctrl>+<alt>+9", "brilho": [18, null]}
   ]
 }
 ```
 
 | Opção                 | Descrição |
 |-----------------------|-----------|
-| `iniciar_com_windows` | `true` ou `false`. Também pode ser alterado pelo menu da bandeja. |
+| `iniciar_com_windows` | `true` ou `false`. |
 | `passo`               | Quanto os atalhos de aumentar e diminuir mudam, em %. |
 | `nomes_monitores`     | Nomes exibidos na janela, na ordem de `--listar`. |
-| `brilho`              | Um **número** vale para todos os monitores. Uma **lista** define um valor por monitor; use `null` para não alterar aquele monitor. |
+| `brilho`              | Um **número** vale para todos os monitores. Uma **lista** define um valor por monitor; `null` significa "não alterar". |
 | `atalho`              | Formato do [pynput](https://pynput.readthedocs.io/en/latest/keyboard.html#global-hotkeys): `<ctrl>`, `<alt>`, `<shift>`, `<cmd>` (a tecla Windows), `<f1>`…`<f12>`, `<page_up>`, letras e números. |
 
 ## Linha de comando
@@ -95,7 +117,7 @@ ControleBrilho.exe --simular        # testa a interface sem mexer nos monitores
 
 - **"Nenhum monitor com DDC/CI encontrado"**: o DDC/CI está desligado no OSD do monitor, ou o cabo, dock ou adaptador não repassa os comandos. Docks USB-C e adaptadores DisplayLink costumam bloquear; a conexão direta por **HDMI** ou **DisplayPort** é a mais confiável.
 - **Só um monitor muda**: o outro provavelmente está com o DDC/CI desligado.
-- **Um atalho não funciona**: outro programa pode estar usando a mesma combinação. Troque-a no `config.json`.
+- **Um atalho não funciona**: outro programa pode estar usando a mesma combinação. Troque-a em **⚙ Configurações…**.
 - **A tela do notebook não aparece**: é esperado, porque telas internas não usam DDC/CI.
 - **Erro logo ao ligar o PC**: alguns monitores demoram a responder após o boot. Ao iniciar com o Windows, o programa tenta de novo por cerca de 1 minuto antes de avisar.
 
