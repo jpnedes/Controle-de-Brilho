@@ -1,0 +1,4 @@
+monitorcontrol>=3.1
+pynput>=1.7
+pystray>=0.19
+pillow>=10
