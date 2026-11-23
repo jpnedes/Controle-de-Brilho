@@ -1,0 +1,52 @@
+# Gera o ControleBrilho.exe no Windows e publica uma release
+# sempre que uma tag "v*" (ex.: v1.0.0) é enviada ao GitHub.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+
+      - name: Gerar o executável
+        run: >
+          python -m PyInstaller --noconfirm --onefile --windowed
+          --name ControleBrilho --icon icone.ico --add-data "icone.ico;."
+          --hidden-import pynput.keyboard._win32
+          --hidden-import pynput.mouse._win32
+          --hidden-import pystray._win32
+          brilho.py
+
+      - name: Empacotar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pacote/ControleBrilho | Out-Null
+          Copy-Item dist/ControleBrilho.exe, README.md pacote/ControleBrilho/
+          Compress-Archive -Path pacote/ControleBrilho -DestinationPath ControleBrilho.zip -Force
+
+      - name: Publicar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag ControleBrilho.zip --clobber
+          } else {
+            gh release create $tag ControleBrilho.zip --title "Controle de Brilho $tag" --notes-file .github/release-notes.md
+          }

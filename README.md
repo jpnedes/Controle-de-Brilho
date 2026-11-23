@@ -114,6 +114,15 @@ python brilho.py
 
 Para gerar o `.exe`, execute o **`build.bat`** no Windows. O arquivo é criado em `dist\ControleBrilho.exe`.
 
+### Publicar uma nova versão
+
+Envie uma tag começando com `v`. O GitHub Actions compila o `.exe` no Windows e publica a release com o `ControleBrilho.zip`.
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
 O código também funciona no **Linux** (X11). Nesse caso:
 - carregue o módulo `i2c-dev` (`sudo modprobe i2c-dev`) e dê ao seu usuário acesso a `/dev/i2c-*` (grupo `i2c`);
 - o ícone na bandeja requer GTK/AppIndicator;
