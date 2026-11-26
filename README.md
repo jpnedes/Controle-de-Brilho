@@ -22,13 +22,13 @@ Controle o brilho de **monitores externos no Windows** via **DDC/CI**, o mesmo c
 ## Download e instalação
 
 1. Baixe o **`ControleBrilho.zip`** da [**página de Releases**](https://github.com/jpnedes/controle-de-brilho/releases/latest).
-2. Clique com o botão direito no arquivo → **Extrair Tudo…** → extraia em `C:\Programas`.
+2. Clique com o botão direito no arquivo → **Extrair Tudo…** → extraia em `C:\Programas`. Também funciona em `C:\Program Files`.
 3. **Ative o DDC/CI no menu (OSD) de cada monitor.** Em muitos modelos ele vem desligado de fábrica.
 4. Dê dois cliques em `C:\Programas\ControleBrilho\ControleBrilho.exe`.
 
 O Windows SmartScreen pode mostrar o aviso *"O Windows protegeu o computador"*, porque o executável não é assinado digitalmente. Clique em **Mais informações → Executar assim mesmo**.
 
-Na primeira execução, o programa cria o `config.json` ao lado do `.exe` e passa a iniciar com o Windows, já minimizado na bandeja.
+Na primeira execução, o programa cria suas configurações em `%APPDATA%\ControleBrilho\config.json` e passa a iniciar com o Windows, já minimizado na bandeja.
 
 **O ícone ficou escondido?** Clique na seta **^** ao lado do relógio e arraste o ☀️ para a barra de tarefas.
 
@@ -74,7 +74,9 @@ Os atalhos precisam usar **Ctrl**, **Alt** ou **Win** junto com outra tecla; as 
 
 ### Editando o `config.json` à mão (opcional)
 
-As configurações ficam no `config.json`, na mesma pasta do `.exe`. Se editar o arquivo diretamente, use **Sair** no menu da bandeja e abra o programa de novo.
+As configurações ficam em `%APPDATA%\ControleBrilho\config.json`. Para chegar até lá, use o botão **Abrir pasta das configurações** na tela de Configurações. Se editar o arquivo diretamente, use **Sair** no menu da bandeja e abra o programa de novo.
+
+**Modo portátil:** se existir um `config.json` na mesma pasta do `.exe` e essa pasta permitir gravação (por exemplo, num pendrive), o programa usa esse arquivo.
 
 ```json
 {
@@ -118,12 +120,13 @@ ControleBrilho.exe --simular        # testa a interface sem mexer nos monitores
 - **"Nenhum monitor com DDC/CI encontrado"**: o DDC/CI está desligado no OSD do monitor, ou o cabo, dock ou adaptador não repassa os comandos. Docks USB-C e adaptadores DisplayLink costumam bloquear; a conexão direta por **HDMI** ou **DisplayPort** é a mais confiável.
 - **Só um monitor muda**: o outro provavelmente está com o DDC/CI desligado.
 - **Um atalho não funciona**: outro programa pode estar usando a mesma combinação. Troque-a em **⚙ Configurações…**.
+- **Erro "Permission denied … config.json"** (versão 1.1.0 ou anterior): acontecia com o programa em `C:\Program Files`. Atualize para a versão mais recente.
 - **A tela do notebook não aparece**: é esperado, porque telas internas não usam DDC/CI.
 - **Erro logo ao ligar o PC**: alguns monitores demoram a responder após o boot. Ao iniciar com o Windows, o programa tenta de novo por cerca de 1 minuto antes de avisar.
 
 ## Desinstalar
 
-Clique com o botão direito no ☀️, desmarque **Iniciar com o Windows** e clique em **Sair**. Depois apague a pasta do programa.
+Clique com o botão direito no ☀️, desmarque **Iniciar com o Windows** e clique em **Sair**. Depois apague a pasta do programa e, se quiser remover também as configurações, a pasta `%APPDATA%\ControleBrilho`.
 
 ## Rodar pelo código-fonte
 

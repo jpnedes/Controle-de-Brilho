@@ -16,19 +16,65 @@ Uso:
 
 import argparse
 import json
+import os
 import queue
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
-# Empacotado como .exe (PyInstaller), o config.json fica ao lado do executável.
-if getattr(sys, "frozen", False):
+if getattr(sys, "frozen", False):  # empacotado como .exe (PyInstaller)
     PASTA = Path(sys.executable).resolve().parent
 else:
     PASTA = Path(__file__).resolve().parent
-ARQUIVO_CONFIG = PASTA / "config.json"
+
+
+def _pasta_gravavel(pasta):
+    """Testa de verdade se dá para criar arquivos na pasta (ex.: Arquivos de
+    Programas exige administrador e recusa a gravação)."""
+    try:
+        with tempfile.TemporaryFile(dir=pasta):
+            return True
+    except OSError:
+        return False
+
+
+def _escolher_arquivo_config():
+    """Onde fica o config.json:
+    1. ao lado do programa, se já existir um ali e a pasta aceitar gravação
+       (modo portátil e compatibilidade com versões anteriores);
+    2. senão, na pasta do usuário: %APPDATA%\\ControleBrilho (Windows) ou
+       ~/.config/controle-brilho (Linux).
+    """
+    local = PASTA / "config.json"
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        do_usuario = base / "ControleBrilho" / "config.json"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        do_usuario = base / "controle-brilho" / "config.json"
+
+    if local.exists() and _pasta_gravavel(PASTA):
+        return local
+    if do_usuario.exists():
+        return do_usuario
+    if local.exists():
+        # Existe ao lado do programa, mas a pasta é protegida: copia para o usuário.
+        try:
+            do_usuario.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(local, do_usuario)
+        except OSError:
+            return local  # ao menos dá para ler
+        return do_usuario
+    if not getattr(sys, "frozen", False) and _pasta_gravavel(PASTA):
+        return local  # rodando pelo código-fonte: mantém ao lado do script
+    return do_usuario
+
+
+ARQUIVO_CONFIG = _escolher_arquivo_config()
 TEM_CONSOLE = sys.stdout is not None and not getattr(sys, "frozen", False)
 
 
@@ -75,10 +121,17 @@ CONFIG_PADRAO = {
 
 def carregar_config():
     if not ARQUIVO_CONFIG.exists():
-        ARQUIVO_CONFIG.write_text(
-            json.dumps(CONFIG_PADRAO, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        print(f"Arquivo de configuração criado em {ARQUIVO_CONFIG}")
+        try:
+            ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            ARQUIVO_CONFIG.write_text(
+                json.dumps(CONFIG_PADRAO, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            if TEM_CONSOLE:
+                print(f"Arquivo de configuração criado em {ARQUIVO_CONFIG}")
+        except OSError as e:
+            avisar(f"Não foi possível criar {ARQUIVO_CONFIG}:\n{e}\n\n"
+                   "O programa vai usar as configurações padrão.", erro=True)
+            return json.loads(json.dumps(CONFIG_PADRAO))
     try:
         cfg = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
@@ -90,6 +143,7 @@ def carregar_config():
 
 def salvar_config(cfg):
     try:
+        ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
         ARQUIVO_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
         return True
     except Exception as e:
@@ -951,7 +1005,9 @@ class JanelaConfig:
                             variable=self.autostart).grid(row=3, column=0, sticky="w", pady=(10, 0))
 
         botoes = ttk.Frame(corpo)
-        botoes.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        botoes.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(botoes, text="Abrir pasta das configurações",
+                   command=self.abrir_pasta).pack(side="left")
         ttk.Button(botoes, text="Cancelar", command=self.fechar).pack(side="right")
         ttk.Button(botoes, text="Salvar", command=self.salvar).pack(side="right", padx=(0, 6))
 
@@ -959,6 +1015,20 @@ class JanelaConfig:
         j.deiconify()
         j.lift()
         j.focus_force()
+
+    def abrir_pasta(self):
+        pasta = ARQUIVO_CONFIG.parent
+        try:
+            pasta.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(pasta))
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(pasta)])
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showinfo("Configurações", f"As configurações ficam em:\n{ARQUIVO_CONFIG}\n\n({e})",
+                                parent=self.janela)
 
     # ---- presets ----
 
